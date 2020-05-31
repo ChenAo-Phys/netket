@@ -1,7 +1,13 @@
 from .abstract_machine import AbstractMachine
 import torch as _torch
 import numpy as _np
+import sys
 import warnings
+
+try:
+    import backpack
+except ImportError:
+    pass
 
 
 def _get_number_parameters(m):
@@ -15,12 +21,15 @@ def _get_differentiable_parameters(m):
 
 
 class Torch(AbstractMachine):
-    def __init__(self, module, hilbert, dtype, outdtype=None):
+    def __init__(self, module, hilbert, dtype, outdtype=None, use_backpack=False):
         self._module = _torch.jit.load(module) if isinstance(module, str) else module
         self._module.double()
         self._n_par = _get_number_parameters(self._module)
         self._parameters = list(_get_differentiable_parameters(self._module))
-
+        self._use_backpack = use_backpack
+        if self._use_backpack:
+            assert "backpack" in sys.modules, "BackPACK was not successfully imported"
+            self._module = backpack.extend(self._module)
         # TODO check that module has input shape compatible with hilbert size
         super().__init__(hilbert, dtype=dtype, outdtype=outdtype)
 
@@ -54,10 +63,10 @@ class Torch(AbstractMachine):
                 "PyTorch machines have real parameters, imaginary part will be discarded"
             )
         torch_pars = _torch.from_numpy(p.real)
-        if torch_pars.numel() != self.n_par:
+        if torch_pars.numel() != self._n_par:
             raise ValueError(
                 "p has wrong shape: {}; expected [{}]".format(
-                    torch_pars.size(), self.n_par
+                    torch_pars.size(), self._n_par
                 )
             )
         i = 0
@@ -76,50 +85,68 @@ class Torch(AbstractMachine):
     def log_val(self, x, out=None):
         if len(x.shape) == 1:
             x = x[_np.newaxis, :]
-
         batch_shape = x.shape[:-1]
 
         with _torch.no_grad():
             t_out = self._module(_torch.from_numpy(x)).numpy().view(_np.complex128)
-
         if out is None:
             return t_out.reshape(batch_shape)
-
         _np.copyto(out, t_out.reshape(-1))
 
         return out
 
     def der_log(self, x, out=None):
+
         if len(x.shape) == 1:
             x = x[_np.newaxis, :]
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
 
+        if out is None:
+            out = _np.empty([x.shape[0], self._n_par], dtype=_np.complex128)
         x = _torch.tensor(x, dtype=_torch.float64)
-        out = x.new_empty([x.size(0), 2, self._n_par], dtype=self._parameters[0].dtype)
-        m = self._module(x)
 
-        for i in range(x.size(0)):
-            dws_real = _torch.autograd.grad(
-                m[i, 0], self._parameters, retain_graph=True
-            )
-            dws_imag = _torch.autograd.grad(
-                m[i, 1], self._parameters, retain_graph=True
-            )
-            _torch.cat([dw.flatten() for dw in dws_real], out=out[i, 0, ...])
-            _torch.cat([dw.flatten() for dw in dws_imag], out=out[i, 1, ...])
+        if self._use_backpack:
 
-        out_complex = _np.zeros((out.size(0), out.size(2)), dtype=_np.complex128)
-        out_complex = out[:, 0, :].numpy() + 1.0j * out[:, 1, :].numpy()
+            def write_to(dst):
+                dst = _torch.from_numpy(dst)
+                i = 0
+                for gb in (
+                    p.grad_batch.flatten(start_dim=1)
+                    for p in self._module.parameters()
+                    if p.requires_grad
+                ):
+                    dst[:, i : i + gb.shape[1]].copy_(gb)
+                    i += gb.shape[1]
 
-        return out_complex.reshape(
-            tuple(list(batch_shape) + list(out_complex.shape[-1:]))
-        )
+            m_sum_real = self._module(x)[:, 0].sum(dim=0)
+            with backpack.backpack(backpack.extensions.BatchGrad()):
+                m_sum_real.backward()
+            write_to(out.real)
+            m_sum_imag = self._module(x)[:, 1].sum(dim=0)
+            with backpack.backpack(backpack.extensions.BatchGrad()):
+                m_sum_imag.backward()
+            write_to(out.imag)
+            self._module.zero_grad()
+        else:
+            m = self._module(x)
+
+            for i in range(x.size(0)):
+                dws_real = _torch.autograd.grad(
+                    m[i, 0], self._parameters, retain_graph=True
+                )
+                dws_imag = _torch.autograd.grad(
+                    m[i, 1], self._parameters, retain_graph=True
+                )
+                out[i, ...].real = _torch.cat([dw.flatten() for dw in dws_real]).numpy()
+                out[i, ...].imag = _torch.cat([dw.flatten() for dw in dws_imag]).numpy()
+            self._module.zero_grad()
+        return out.reshape(tuple(list(batch_shape) + list(out.shape[-1:])))
 
     def vector_jacobian_prod(self, x, vec, out=None):
 
         if out is None:
-            out = _np.empty(self.n_par, dtype=_np.complex128)
+            out = _np.empty(self._n_par, dtype=_np.complex128)
 
         def write_to(dst):
             dst = _torch.from_numpy(dst)
