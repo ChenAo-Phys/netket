@@ -10,7 +10,6 @@ SEED = 3141592
 
 
 def _setup_vmc(**kwargs):
-    nk.utils.seed(SEED)
     nk.random.seed(SEED)
     g = nk.graph.Hypercube(length=8, n_dim=1)
     hi = nk.hilbert.Spin(s=0.5, graph=g)
@@ -21,7 +20,7 @@ def _setup_vmc(**kwargs):
     ha = nk.operator.Ising(hi, h=1.0)
     sa = nk.sampler.MetropolisLocal(machine=ma)
 
-    op = nk.optimizer.Sgd(learning_rate=0.1)
+    op = nk.optimizer.Sgd(ma, learning_rate=0.1)
 
     vmc = nk.variational.Vmc(hamiltonian=ha, sampler=sa, optimizer=op, **kwargs)
 
@@ -194,8 +193,8 @@ def test_ed():
 
 def test_ed_restricted():
     g = nk.graph.Hypercube(length=8, n_dim=1, pbc=True)
-    hi1 = nk.hilbert.PySpin(s=0.5, graph=g, total_sz=0)
-    hi2 = nk.hilbert.PySpin(s=0.5, graph=g)
+    hi1 = nk.hilbert.Spin(s=0.5, graph=g, total_sz=0)
+    hi2 = nk.hilbert.Spin(s=0.5, graph=g)
 
     ham1 = nk.operator.Heisenberg(hi1)
     ham2 = nk.operator.Heisenberg(hi2)
